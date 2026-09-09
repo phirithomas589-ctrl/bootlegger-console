@@ -4,6 +4,8 @@ import json
 from datetime import datetime, timezone
 from random import choice, randint, uniform
 from time import time
+from urllib.error import URLError
+from urllib.request import urlopen
 from uuid import uuid4
 
 import pandas as pd
@@ -87,6 +89,41 @@ def maybe_create_backup() -> None:
         create_backup("automatic")
 
 
+def parse_prometheus_metrics(payload: str) -> dict[str, float]:
+    metrics = {}
+    for line in payload.splitlines():
+        if not line or line.startswith("#") or " " not in line:
+            continue
+        name, value = line.rsplit(" ", 1)
+        metric_name = name.split("{", 1)[0]
+        try:
+            metrics[metric_name] = float(value)
+        except ValueError:
+            continue
+    return metrics
+
+
+def infrastructure_metrics(source: str, endpoint: str, events: list[dict]) -> tuple[dict[str, float], str]:
+    if source == "Prometheus endpoint":
+        try:
+            with urlopen(endpoint, timeout=2) as response:
+                return parse_prometheus_metrics(response.read().decode("utf-8")), "Prometheus scrape healthy"
+        except (OSError, URLError, ValueError):
+            return {}, "Prometheus endpoint unavailable"
+
+    event_count = len(events)
+    average_latency = sum(event["latency_ms"] for event in events) / max(event_count, 1)
+    accepted_rate = sum(event["status"] == "accepted" for event in events) / max(event_count, 1)
+    return {
+        "bootlegger_cpu_utilization": min(92, 24 + average_latency / 5),
+        "bootlegger_memory_utilization": min(88, 41 + event_count / 8),
+        "bootlegger_disk_utilization": 62 + event_count / 20,
+        "bootlegger_load1": max(0.1, average_latency / 100),
+        "bootlegger_active_series": 1200 + event_count * 7,
+        "bootlegger_queue_depth": max(0, int((1 - accepted_rate) * event_count)),
+    }, "Derived telemetry simulator"
+
+
 if "events" not in st.session_state:
     st.session_state.events = seed_events()
 if "started_at" not in st.session_state:
@@ -114,6 +151,12 @@ with st.sidebar:
     connection = st.selectbox("Source", ["Bootlegger simulator", "Custom adapter"], label_visibility="collapsed")
     st.text_input("Endpoint", value="ws://localhost:8765/stream", disabled=connection == "Bootlegger simulator")
     refresh_rate = st.select_slider("Refresh rate", options=["250 ms", "1 sec", "5 sec", "Manual"], value="1 sec")
+
+    st.divider()
+    st.markdown("### Infrastructure telemetry")
+    telemetry_source = st.selectbox("Metrics source", ["Derived simulator", "Prometheus endpoint"])
+    prometheus_endpoint = st.text_input("Prometheus URL", value="http://localhost:9090/metrics", disabled=telemetry_source == "Derived simulator")
+    scrape_interval = st.selectbox("Scrape interval", ["On refresh", "15 sec", "30 sec"])
 
     st.divider()
     st.markdown("### View filters")
@@ -297,6 +340,37 @@ with bi_risk:
             risk_view["timestamp"] = risk_view["timestamp"].dt.strftime("%H:%M:%S")
             risk_view = risk_view.rename(columns={"timestamp": "Time", "id": "Event ID", "stream": "Stream", "type": "Type", "status": "Status", "latency_ms": "Latency", "records": "Records"})
             st.dataframe(risk_view, hide_index=True, use_container_width=True, height=220, column_config={"Latency": st.column_config.NumberColumn(format="%.1f ms")})
+
+st.write("")
+st.markdown("### Prometheus infrastructure")
+infra_values, infra_status = infrastructure_metrics(telemetry_source, prometheus_endpoint, st.session_state.events)
+if telemetry_source == "Prometheus endpoint" and not infra_values:
+    st.warning(f"{infra_status}. Showing the panel without live values.")
+else:
+    st.caption(f"{infra_status} · {scrape_interval.lower()}")
+
+cpu = infra_values.get("bootlegger_cpu_utilization", infra_values.get("node_cpu_utilization_ratio", 0) * 100)
+memory = infra_values.get("bootlegger_memory_utilization", 0)
+if "node_memory_MemTotal_bytes" in infra_values and "node_memory_MemAvailable_bytes" in infra_values:
+    memory = (1 - infra_values["node_memory_MemAvailable_bytes"] / max(infra_values["node_memory_MemTotal_bytes"], 1)) * 100
+disk = infra_values.get("bootlegger_disk_utilization", 0)
+if "node_filesystem_size_bytes" in infra_values and "node_filesystem_avail_bytes" in infra_values:
+    disk = (1 - infra_values["node_filesystem_avail_bytes"] / max(infra_values["node_filesystem_size_bytes"], 1)) * 100
+load = infra_values.get("bootlegger_load1", infra_values.get("node_load1", 0))
+series = infra_values.get("bootlegger_active_series", infra_values.get("prometheus_tsdb_head_series", 0))
+queue = infra_values.get("bootlegger_queue_depth", 0)
+infra_cards = st.columns(6)
+infra_metrics = [
+    ("CPU", f"{cpu:.1f}%", "utilization"),
+    ("Memory", f"{memory:.1f}%", "used"),
+    ("Disk", f"{disk:.1f}%", "used"),
+    ("Load 1m", f"{load:.2f}", "system load"),
+    ("Active series", f"{series:,.0f}", "Prometheus"),
+    ("Queue depth", f"{queue:,.0f}", "events"),
+]
+for column, (label, value, detail) in zip(infra_cards, infra_metrics):
+    with column:
+        st.markdown(f'<div class="metric-card"><div class="metric-label">{label}</div><div class="metric-value">{value}</div><div class="subtle">{detail}</div></div>', unsafe_allow_html=True)
 
 st.write("")
 left, right = st.columns([1.5, 1])
