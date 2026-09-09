@@ -83,7 +83,7 @@ with st.sidebar:
 
     st.divider()
     st.caption("Adapter status")
-    st.success("Connected", icon="●")
+    st.success("Connected")
     st.caption(f"Session started {datetime.fromtimestamp(st.session_state.started_at).strftime('%H:%M:%S')}")
 
 st.markdown(
