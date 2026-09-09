@@ -233,6 +233,72 @@ for column, (label, value, detail) in zip(metrics, metric_values):
         st.markdown(f'<div class="metric-card"><div class="metric-label">{label}</div><div class="metric-value">{value}</div><div class="subtle">{detail}</div></div>', unsafe_allow_html=True)
 
 st.write("")
+st.markdown("### Business intelligence")
+bi_overview, bi_streams, bi_risk = st.tabs(["Executive overview", "Stream performance", "Risk & anomalies"])
+bi_data = pd.DataFrame(st.session_state.events)
+if not bi_data.empty:
+    bi_data["timestamp"] = pd.to_datetime(bi_data["timestamp"], utc=True)
+
+with bi_overview:
+    if bi_data.empty:
+        st.info("Waiting for enough events to calculate business intelligence.")
+    else:
+        overview_left, overview_right = st.columns(2)
+        with overview_left:
+            st.caption("Event mix")
+            event_mix = bi_data["type"].value_counts().rename_axis("Event type").to_frame("Events")
+            st.bar_chart(event_mix, height=220, color="#77a982")
+        with overview_right:
+            st.caption("Outcome mix")
+            outcome_mix = bi_data["status"].value_counts().rename_axis("Status").to_frame("Events")
+            st.bar_chart(outcome_mix, height=220, color="#d6ad60")
+
+with bi_streams:
+    if bi_data.empty:
+        st.info("Waiting for stream activity.")
+    else:
+        stream_summary = bi_data.groupby("stream").agg(
+            Events=("id", "count"),
+            Records=("records", "sum"),
+            Latency=("latency_ms", "mean"),
+            Accepted=("status", lambda values: (values == "accepted").mean() * 100),
+        ).sort_values("Records", ascending=False)
+        stream_left, stream_right = st.columns([1.15, 1])
+        with stream_left:
+            st.caption("Records processed by stream")
+            st.bar_chart(stream_summary["Records"], height=250, color="#77a982")
+        with stream_right:
+            stream_table = stream_summary.reset_index().rename(columns={"stream": "Stream", "Latency": "Mean latency", "Accepted": "Acceptance rate"})
+            st.dataframe(
+                stream_table,
+                hide_index=True,
+                use_container_width=True,
+                height=250,
+                column_config={
+                    "Mean latency": st.column_config.NumberColumn(format="%.1f ms"),
+                    "Acceptance rate": st.column_config.NumberColumn(format="%.1f%%"),
+                },
+            )
+
+with bi_risk:
+    if bi_data.empty:
+        st.info("Waiting for events to identify operational risk.")
+    else:
+        latency_limit = bi_data["latency_ms"].quantile(0.95)
+        risk_events = bi_data[(bi_data["status"] == "warning") | (bi_data["latency_ms"] >= latency_limit)]
+        risk_metrics = st.columns(3)
+        risk_metrics[0].metric("Warnings", int((bi_data["status"] == "warning").sum()))
+        risk_metrics[1].metric("Latency p95", f"{latency_limit:.0f} ms")
+        risk_metrics[2].metric("At-risk events", len(risk_events))
+        if risk_events.empty:
+            st.success("No warning or high-latency events in the current window.")
+        else:
+            risk_view = risk_events[["timestamp", "id", "stream", "type", "status", "latency_ms", "records"]].copy()
+            risk_view["timestamp"] = risk_view["timestamp"].dt.strftime("%H:%M:%S")
+            risk_view = risk_view.rename(columns={"timestamp": "Time", "id": "Event ID", "stream": "Stream", "type": "Type", "status": "Status", "latency_ms": "Latency", "records": "Records"})
+            st.dataframe(risk_view, hide_index=True, use_container_width=True, height=220, column_config={"Latency": st.column_config.NumberColumn(format="%.1f ms")})
+
+st.write("")
 left, right = st.columns([1.5, 1])
 with left:
     st.markdown("### Throughput")

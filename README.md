@@ -13,4 +13,6 @@ streamlit run app.py
 
 The current app uses a local event simulator so the interface can be exercised immediately. Replace `make_event()` in `app.py` with a Bootlegger websocket, Kafka, or webhook consumer when the source contract is available.
 
+Business intelligence views provide executive event and outcome mix, stream-level throughput and acceptance comparisons, plus warning and high-latency anomaly detection.
+
 The console includes a session-scoped point-in-time backup engine. It can automatically checkpoint the current event state, retain a configurable number of recovery points, restore a selected checkpoint, and export a checkpoint as JSON. Streamlit Cloud sessions are ephemeral, so export checkpoints for durable storage or replace `create_backup()` with an external object store/database when production persistence is required.
