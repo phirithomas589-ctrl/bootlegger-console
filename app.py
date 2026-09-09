@@ -11,7 +11,7 @@ from uuid import uuid4
 import pandas as pd
 import streamlit as st
 
-from engine import event_to_json, parse_prometheus_metrics, scrape_web_page
+from engine import credentials_match as match_credentials, event_to_json, parse_prometheus_metrics, scrape_web_page
 
 
 st.set_page_config(
@@ -21,7 +21,18 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-is_admin = bool(getattr(st.user, "is_logged_in", False))
+
+def configured_control_room() -> tuple[str, str]:
+    try:
+        credentials = st.secrets.get("control_room", {})
+    except Exception:
+        credentials = {}
+    return str(credentials.get("username", "")), str(credentials.get("password", ""))
+
+
+def credentials_match(username: str, password: str) -> bool:
+    expected_username, expected_password = configured_control_room()
+    return match_credentials(username, password, expected_username, expected_password)
 
 
 EVENT_TYPES = ["transaction", "heartbeat", "alert", "snapshot"]
@@ -143,6 +154,10 @@ if "last_scrape_at" not in st.session_state:
     st.session_state.last_scrape_at = 0.0
 if "latest_scrape" not in st.session_state:
     st.session_state.latest_scrape = None
+if "control_room_authenticated" not in st.session_state:
+    st.session_state.control_room_authenticated = False
+
+is_admin = st.session_state.control_room_authenticated
 
 
 with st.sidebar:
@@ -151,13 +166,19 @@ with st.sidebar:
     st.divider()
     st.markdown("### Control room access")
     if is_admin:
-        st.success(f"Signed in: {getattr(st.user, 'email', 'Google account')}")
-        if st.button("Sign out", use_container_width=True):
-            st.logout()
+        st.success("Signed in as admin")
+        if st.button("Lock control room", use_container_width=True):
+            st.session_state.control_room_authenticated = False
+            st.rerun()
     else:
         st.info("Admin controls are locked.")
-        if st.button("Sign in with Google", type="primary", use_container_width=True):
-            st.login("google")
+        st.text_input("Username", key="control_room_username")
+        st.text_input("Password", type="password", key="control_room_password")
+        if st.button("Unlock control room", type="primary", use_container_width=True):
+            if credentials_match(st.session_state.control_room_username, st.session_state.control_room_password):
+                st.session_state.control_room_authenticated = True
+                st.rerun()
+            st.error("Invalid control room credentials.")
     st.divider()
 
     st.markdown("### Connection")

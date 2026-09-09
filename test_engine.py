@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from unittest.mock import patch
 
-from engine import event_to_json, parse_prometheus_metrics, scrape_web_page
+from engine import credentials_match, event_to_json, parse_prometheus_metrics, scrape_web_page
 
 
 class FakeResponse:
@@ -76,3 +76,9 @@ def test_event_to_json_preserves_fields_and_serializes_timestamp():
     assert serialized["id"] == "evt_1"
     assert serialized["records"] == 4
     assert serialized["timestamp"] == "2026-09-09T12:30:00+00:00"
+
+
+def test_credentials_match_requires_exact_configured_values():
+    assert credentials_match("admin", "correct", "admin", "correct")
+    assert not credentials_match("admin", "wrong", "admin", "correct")
+    assert not credentials_match("", "", "", "")

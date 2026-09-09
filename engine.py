@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from html.parser import HTMLParser
+import hmac
 from urllib.error import URLError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
@@ -9,6 +10,10 @@ from urllib.request import Request, urlopen
 
 def event_to_json(event: dict) -> dict:
     return {**event, "timestamp": event["timestamp"].isoformat()}
+
+
+def credentials_match(username: str, password: str, expected_username: str, expected_password: str) -> bool:
+    return bool(expected_username and expected_password) and hmac.compare_digest(username, expected_username) and hmac.compare_digest(password, expected_password)
 
 
 def parse_prometheus_metrics(payload: str) -> dict[str, float]:
