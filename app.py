@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from random import choice, randint, uniform
 from time import time
+from uuid import uuid4
 
 import pandas as pd
 import streamlit as st
@@ -56,6 +58,35 @@ def filtered_events() -> list[dict]:
     return events
 
 
+def event_to_json(event: dict) -> dict:
+    return {**event, "timestamp": event["timestamp"].isoformat()}
+
+
+def create_backup(reason: str) -> None:
+    snapshot = {
+        "id": f"bkp_{uuid4().hex[:10]}",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "reason": reason,
+        "events": [event_to_json(event) for event in st.session_state.events],
+    }
+    st.session_state.backups.insert(0, snapshot)
+    st.session_state.backups = st.session_state.backups[: st.session_state.backup_retention]
+    st.session_state.last_backup_at = time()
+
+
+def restore_backup(snapshot: dict) -> None:
+    st.session_state.events = [
+        {**event, "timestamp": datetime.fromisoformat(event["timestamp"])}
+        for event in snapshot["events"]
+    ]
+
+
+def maybe_create_backup() -> None:
+    interval = {"30 sec": 30, "1 min": 60, "5 min": 300}.get(st.session_state.backup_frequency)
+    if interval and time() - st.session_state.last_backup_at >= interval:
+        create_backup("automatic")
+
+
 if "events" not in st.session_state:
     st.session_state.events = seed_events()
 if "started_at" not in st.session_state:
@@ -64,6 +95,14 @@ if "selected_stream" not in st.session_state:
     st.session_state.selected_stream = "all"
 if "selected_type" not in st.session_state:
     st.session_state.selected_type = "all"
+if "backups" not in st.session_state:
+    st.session_state.backups = []
+if "backup_frequency" not in st.session_state:
+    st.session_state.backup_frequency = "1 min"
+if "backup_retention" not in st.session_state:
+    st.session_state.backup_retention = 12
+if "last_backup_at" not in st.session_state:
+    st.session_state.last_backup_at = time()
 
 
 with st.sidebar:
@@ -80,6 +119,35 @@ with st.sidebar:
     st.markdown("### View filters")
     st.session_state.selected_stream = st.selectbox("Stream", ["all", *STREAMS], format_func=lambda value: "All streams" if value == "all" else value.title())
     st.session_state.selected_type = st.selectbox("Event type", ["all", *EVENT_TYPES], format_func=lambda value: "All event types" if value == "all" else value.title())
+
+    st.divider()
+    st.markdown("### Point-in-time backups")
+    st.session_state.backup_frequency = st.selectbox("Automatic checkpoint", ["30 sec", "1 min", "5 min", "Manual"], index=1)
+    st.session_state.backup_retention = st.slider("Retain checkpoints", 3, 30, st.session_state.backup_retention)
+    if st.button("Create checkpoint", use_container_width=True):
+        create_backup("manual")
+        st.rerun()
+    if st.session_state.backups:
+        backup_options = {
+            f'{backup["created_at"][:19].replace("T", " ")} · {backup["reason"]} · {len(backup["events"])} events': index
+            for index, backup in enumerate(st.session_state.backups)
+        }
+        selected_backup = st.selectbox("Restore checkpoint", list(backup_options))
+        restore_col, download_col = st.columns(2)
+        with restore_col:
+            if st.button("Restore", use_container_width=True):
+                restore_backup(st.session_state.backups[backup_options[selected_backup]])
+                st.rerun()
+        with download_col:
+            st.download_button(
+                "Export",
+                data=json.dumps(st.session_state.backups[backup_options[selected_backup]], indent=2),
+                file_name="bootlegger-backup.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+    else:
+        st.caption("No checkpoints yet")
 
     st.divider()
     st.caption("Adapter status")
@@ -145,6 +213,7 @@ if st.session_state.streaming and refresh_seconds:
 
 if st.session_state.streaming:
     append_live_event()
+maybe_create_backup()
 
 visible_events = filtered_events()
 accepted = sum(event["status"] == "accepted" for event in st.session_state.events)
@@ -178,6 +247,31 @@ with right:
     st.markdown("### Stream health")
     health_rows = pd.DataFrame({"Signal": ["Connection", "Consumer lag", "Schema", "Backpressure"], "Value": ["Healthy", "42 ms", "v2.4 valid", "None"]})
     st.dataframe(health_rows, hide_index=True, use_container_width=True, height=220)
+
+st.write("")
+backup_left, backup_right = st.columns([1.5, 1])
+with backup_left:
+    st.markdown("### Backup timeline")
+    if st.session_state.backups:
+        backup_rows = pd.DataFrame([
+            {
+                "Checkpoint": backup["id"],
+                "Created": backup["created_at"].replace("T", " ")[:19],
+                "Mode": backup["reason"].title(),
+                "Events": len(backup["events"]),
+            }
+            for backup in st.session_state.backups
+        ])
+        st.dataframe(backup_rows, hide_index=True, use_container_width=True, height=190)
+    else:
+        st.info("Automatic checkpoints will appear here.")
+with backup_right:
+    st.markdown("### Recovery point")
+    if st.session_state.backups:
+        latest_backup = st.session_state.backups[0]
+        st.markdown(f'<div class="metric-card"><div class="metric-label">Latest checkpoint</div><div class="metric-value">{len(st.session_state.backups)}</div><div class="subtle">{latest_backup["created_at"].replace("T", " ")[:19]} UTC · {len(latest_backup["events"])} events</div></div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="metric-card"><div class="metric-label">Latest checkpoint</div><div class="metric-value">--</div><div class="subtle">Waiting for the first checkpoint</div></div>', unsafe_allow_html=True)
 
 st.write("")
 st.markdown(f"### Event feed <span class='subtle'>· {len(visible_events)} visible</span>", unsafe_allow_html=True)
