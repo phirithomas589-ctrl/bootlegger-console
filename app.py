@@ -2,16 +2,16 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from html.parser import HTMLParser
 from random import choice, randint, uniform
 from time import time
 from urllib.error import URLError
-from urllib.parse import urljoin
-from urllib.request import Request, urlopen
+from urllib.request import urlopen
 from uuid import uuid4
 
 import pandas as pd
 import streamlit as st
+
+from engine import event_to_json, parse_prometheus_metrics, scrape_web_page
 
 
 st.set_page_config(
@@ -20,6 +20,8 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+is_admin = bool(getattr(st.user, "is_logged_in", False))
 
 
 EVENT_TYPES = ["transaction", "heartbeat", "alert", "snapshot"]
@@ -62,10 +64,6 @@ def filtered_events() -> list[dict]:
     return events
 
 
-def event_to_json(event: dict) -> dict:
-    return {**event, "timestamp": event["timestamp"].isoformat()}
-
-
 def create_backup(reason: str) -> None:
     snapshot = {
         "id": f"bkp_{uuid4().hex[:10]}",
@@ -101,20 +99,6 @@ def maybe_scrape_web(url: str) -> None:
         st.session_state.last_scrape_at = time()
 
 
-def parse_prometheus_metrics(payload: str) -> dict[str, float]:
-    metrics = {}
-    for line in payload.splitlines():
-        if not line or line.startswith("#") or " " not in line:
-            continue
-        name, value = line.rsplit(" ", 1)
-        metric_name = name.split("{", 1)[0]
-        try:
-            metrics[metric_name] = float(value)
-        except ValueError:
-            continue
-    return metrics
-
-
 def infrastructure_metrics(source: str, endpoint: str, events: list[dict]) -> tuple[dict[str, float], str]:
     if source == "Prometheus endpoint":
         try:
@@ -134,77 +118,6 @@ def infrastructure_metrics(source: str, endpoint: str, events: list[dict]) -> tu
         "bootlegger_active_series": 1200 + event_count * 7,
         "bootlegger_queue_depth": max(0, int((1 - accepted_rate) * event_count)),
     }, "Derived telemetry simulator"
-
-
-class WebPageParser(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.title_parts: list[str] = []
-        self.text_parts: list[str] = []
-        self.links: list[str] = []
-        self.in_title = False
-        self.ignored_depth = 0
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag == "title":
-            self.in_title = True
-        if tag in {"script", "style", "noscript"}:
-            self.ignored_depth += 1
-        if tag == "a":
-            href = dict(attrs).get("href")
-            if href:
-                self.links.append(href)
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag == "title":
-            self.in_title = False
-        if tag in {"script", "style", "noscript"} and self.ignored_depth:
-            self.ignored_depth -= 1
-
-    def handle_data(self, data: str) -> None:
-        if self.in_title:
-            self.title_parts.append(data)
-        elif not self.ignored_depth:
-            self.text_parts.append(data)
-
-
-def scrape_web_page(url: str) -> dict:
-    fetched_at = datetime.now(timezone.utc).isoformat()
-    try:
-        if not url.startswith(("http://", "https://")):
-            raise ValueError("Only HTTP and HTTPS URLs are supported")
-        request = Request(url, headers={"User-Agent": "BootleggerIngestion/1.0"})
-        with urlopen(request, timeout=5) as response:
-            html = response.read(2_000_000).decode("utf-8", errors="replace")
-            final_url = response.geturl()
-        parser = WebPageParser()
-        parser.feed(html)
-        text = " ".join(" ".join(parser.text_parts).split())
-        links = sorted({urljoin(final_url, link) for link in parser.links})
-        return {
-            "fetched_at": fetched_at,
-            "url": final_url,
-            "title": " ".join(" ".join(parser.title_parts).split()) or "Untitled page",
-            "text": text,
-            "word_count": len(text.split()),
-            "link_count": len(links),
-            "links": links[:100],
-            "status": "healthy",
-            "error": "",
-        }
-    except (OSError, URLError, UnicodeError, ValueError) as error:
-        return {
-            "fetched_at": fetched_at,
-            "url": url,
-            "title": "",
-            "text": "",
-            "word_count": 0,
-            "link_count": 0,
-            "links": [],
-            "status": "error",
-            "error": str(error),
-        }
-
 
 if "events" not in st.session_state:
     st.session_state.events = seed_events()
@@ -236,6 +149,16 @@ with st.sidebar:
     st.markdown("## ◉ BOOTLEGGER")
     st.caption("Live data operations console")
     st.divider()
+    st.markdown("### Control room access")
+    if is_admin:
+        st.success(f"Signed in: {getattr(st.user, 'email', 'Google account')}")
+        if st.button("Sign out", use_container_width=True):
+            st.logout()
+    else:
+        st.info("Admin controls are locked.")
+        if st.button("Sign in with Google", type="primary", use_container_width=True):
+            st.login("google")
+    st.divider()
 
     st.markdown("### Connection")
     connection = st.selectbox("Source", ["Bootlegger simulator", "Custom adapter"], label_visibility="collapsed")
@@ -250,14 +173,19 @@ with st.sidebar:
 
     st.divider()
     st.markdown("### Web ingestion")
-    web_url = st.text_input("Source URL", value="https://example.com")
-    st.session_state.scrape_frequency = st.selectbox("Ingestion schedule", ["Manual", "30 sec", "1 min", "5 min"], index=["Manual", "30 sec", "1 min", "5 min"].index(st.session_state.scrape_frequency))
-    if st.button("Scrape now", use_container_width=True):
-        st.session_state.latest_scrape = scrape_web_page(web_url)
-        st.session_state.scrape_history.insert(0, st.session_state.latest_scrape)
-        st.session_state.scrape_history = st.session_state.scrape_history[:20]
-        st.session_state.last_scrape_at = time()
-        st.rerun()
+    if is_admin:
+        web_url = st.text_input("Source URL", value="https://example.com")
+        st.session_state.scrape_frequency = st.selectbox("Ingestion schedule", ["Manual", "30 sec", "1 min", "5 min"], index=["Manual", "30 sec", "1 min", "5 min"].index(st.session_state.scrape_frequency))
+        if st.button("Scrape now", use_container_width=True):
+            st.session_state.latest_scrape = scrape_web_page(web_url)
+            st.session_state.scrape_history.insert(0, st.session_state.latest_scrape)
+            st.session_state.scrape_history = st.session_state.scrape_history[:20]
+            st.session_state.last_scrape_at = time()
+            st.rerun()
+    else:
+        web_url = "https://example.com"
+        st.session_state.scrape_frequency = "Manual"
+        st.caption("Sign in to configure ingestion.")
 
     st.divider()
     st.markdown("### View filters")
@@ -266,12 +194,16 @@ with st.sidebar:
 
     st.divider()
     st.markdown("### Point-in-time backups")
-    st.session_state.backup_frequency = st.selectbox("Automatic checkpoint", ["30 sec", "1 min", "5 min", "Manual"], index=1)
-    st.session_state.backup_retention = st.slider("Retain checkpoints", 3, 30, st.session_state.backup_retention)
-    if st.button("Create checkpoint", use_container_width=True):
-        create_backup("manual")
-        st.rerun()
-    if st.session_state.backups:
+    if is_admin:
+        st.session_state.backup_frequency = st.selectbox("Automatic checkpoint", ["30 sec", "1 min", "5 min", "Manual"], index=1)
+        st.session_state.backup_retention = st.slider("Retain checkpoints", 3, 30, st.session_state.backup_retention)
+        if st.button("Create checkpoint", use_container_width=True):
+            create_backup("manual")
+            st.rerun()
+    else:
+        st.session_state.backup_frequency = "Manual"
+        st.caption("Sign in to manage recovery points.")
+    if st.session_state.backups and is_admin:
         backup_options = {
             f'{backup["created_at"][:19].replace("T", " ")} · {backup["reason"]} · {len(backup["events"])} events': index
             for index, backup in enumerate(st.session_state.backups)
