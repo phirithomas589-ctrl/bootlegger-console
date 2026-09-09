@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from random import choice, randint, uniform
 from time import time
 from urllib.error import URLError
-from urllib.request import urlopen
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
 from uuid import uuid4
 
 import pandas as pd
@@ -89,6 +91,16 @@ def maybe_create_backup() -> None:
         create_backup("automatic")
 
 
+def maybe_scrape_web(url: str) -> None:
+    interval = {"30 sec": 30, "1 min": 60, "5 min": 300}.get(st.session_state.scrape_frequency)
+    if interval and time() - st.session_state.last_scrape_at >= interval:
+        result = scrape_web_page(url)
+        st.session_state.latest_scrape = result
+        st.session_state.scrape_history.insert(0, result)
+        st.session_state.scrape_history = st.session_state.scrape_history[:20]
+        st.session_state.last_scrape_at = time()
+
+
 def parse_prometheus_metrics(payload: str) -> dict[str, float]:
     metrics = {}
     for line in payload.splitlines():
@@ -124,6 +136,76 @@ def infrastructure_metrics(source: str, endpoint: str, events: list[dict]) -> tu
     }, "Derived telemetry simulator"
 
 
+class WebPageParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title_parts: list[str] = []
+        self.text_parts: list[str] = []
+        self.links: list[str] = []
+        self.in_title = False
+        self.ignored_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "title":
+            self.in_title = True
+        if tag in {"script", "style", "noscript"}:
+            self.ignored_depth += 1
+        if tag == "a":
+            href = dict(attrs).get("href")
+            if href:
+                self.links.append(href)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "title":
+            self.in_title = False
+        if tag in {"script", "style", "noscript"} and self.ignored_depth:
+            self.ignored_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self.in_title:
+            self.title_parts.append(data)
+        elif not self.ignored_depth:
+            self.text_parts.append(data)
+
+
+def scrape_web_page(url: str) -> dict:
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    try:
+        if not url.startswith(("http://", "https://")):
+            raise ValueError("Only HTTP and HTTPS URLs are supported")
+        request = Request(url, headers={"User-Agent": "BootleggerIngestion/1.0"})
+        with urlopen(request, timeout=5) as response:
+            html = response.read(2_000_000).decode("utf-8", errors="replace")
+            final_url = response.geturl()
+        parser = WebPageParser()
+        parser.feed(html)
+        text = " ".join(" ".join(parser.text_parts).split())
+        links = sorted({urljoin(final_url, link) for link in parser.links})
+        return {
+            "fetched_at": fetched_at,
+            "url": final_url,
+            "title": " ".join(" ".join(parser.title_parts).split()) or "Untitled page",
+            "text": text,
+            "word_count": len(text.split()),
+            "link_count": len(links),
+            "links": links[:100],
+            "status": "healthy",
+            "error": "",
+        }
+    except (OSError, URLError, UnicodeError, ValueError) as error:
+        return {
+            "fetched_at": fetched_at,
+            "url": url,
+            "title": "",
+            "text": "",
+            "word_count": 0,
+            "link_count": 0,
+            "links": [],
+            "status": "error",
+            "error": str(error),
+        }
+
+
 if "events" not in st.session_state:
     st.session_state.events = seed_events()
 if "started_at" not in st.session_state:
@@ -140,6 +222,14 @@ if "backup_retention" not in st.session_state:
     st.session_state.backup_retention = 12
 if "last_backup_at" not in st.session_state:
     st.session_state.last_backup_at = time()
+if "scrape_history" not in st.session_state:
+    st.session_state.scrape_history = []
+if "scrape_frequency" not in st.session_state:
+    st.session_state.scrape_frequency = "Manual"
+if "last_scrape_at" not in st.session_state:
+    st.session_state.last_scrape_at = 0.0
+if "latest_scrape" not in st.session_state:
+    st.session_state.latest_scrape = None
 
 
 with st.sidebar:
@@ -157,6 +247,17 @@ with st.sidebar:
     telemetry_source = st.selectbox("Metrics source", ["Derived simulator", "Prometheus endpoint"])
     prometheus_endpoint = st.text_input("Prometheus URL", value="http://localhost:9090/metrics", disabled=telemetry_source == "Derived simulator")
     scrape_interval = st.selectbox("Scrape interval", ["On refresh", "15 sec", "30 sec"])
+
+    st.divider()
+    st.markdown("### Web ingestion")
+    web_url = st.text_input("Source URL", value="https://example.com")
+    st.session_state.scrape_frequency = st.selectbox("Ingestion schedule", ["Manual", "30 sec", "1 min", "5 min"], index=["Manual", "30 sec", "1 min", "5 min"].index(st.session_state.scrape_frequency))
+    if st.button("Scrape now", use_container_width=True):
+        st.session_state.latest_scrape = scrape_web_page(web_url)
+        st.session_state.scrape_history.insert(0, st.session_state.latest_scrape)
+        st.session_state.scrape_history = st.session_state.scrape_history[:20]
+        st.session_state.last_scrape_at = time()
+        st.rerun()
 
     st.divider()
     st.markdown("### View filters")
@@ -257,6 +358,7 @@ if st.session_state.streaming and refresh_seconds:
 if st.session_state.streaming:
     append_live_event()
 maybe_create_backup()
+maybe_scrape_web(web_url)
 
 visible_events = filtered_events()
 accepted = sum(event["status"] == "accepted" for event in st.session_state.events)
@@ -340,6 +442,31 @@ with bi_risk:
             risk_view["timestamp"] = risk_view["timestamp"].dt.strftime("%H:%M:%S")
             risk_view = risk_view.rename(columns={"timestamp": "Time", "id": "Event ID", "stream": "Stream", "type": "Type", "status": "Status", "latency_ms": "Latency", "records": "Records"})
             st.dataframe(risk_view, hide_index=True, use_container_width=True, height=220, column_config={"Latency": st.column_config.NumberColumn(format="%.1f ms")})
+
+st.write("")
+st.markdown("### Web ingestion")
+if st.session_state.latest_scrape:
+    scrape = st.session_state.latest_scrape
+    scrape_left, scrape_right = st.columns([1.5, 1])
+    with scrape_left:
+        if scrape["status"] == "healthy":
+            st.success(f'Ingested {scrape["title"]} from {scrape["url"]}')
+            st.text_area("Latest extracted text", scrape["text"][:4000], height=150)
+        else:
+            st.error(f'Ingestion failed for {scrape["url"]}: {scrape["error"]}')
+    with scrape_right:
+        scrape_cards = st.columns(2)
+        scrape_cards[0].metric("Words", f'{scrape["word_count"]:,}')
+        scrape_cards[1].metric("Links", f'{scrape["link_count"]:,}')
+        st.download_button(
+            "Download latest payload",
+            data=json.dumps(scrape, indent=2),
+            file_name="web-ingestion.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+else:
+    st.info("Configure a URL in the sidebar and run a scrape to start web ingestion.")
 
 st.write("")
 st.markdown("### Prometheus infrastructure")
