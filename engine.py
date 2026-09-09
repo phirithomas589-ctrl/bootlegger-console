@@ -62,14 +62,14 @@ class WebPageParser(HTMLParser):
             self.text_parts.append(data)
 
 
-def scrape_web_page(url: str) -> dict:
+def scrape_web_page(url: str, max_bytes: int = 2_000_000, max_links: int = 100) -> dict:
     fetched_at = datetime.now(timezone.utc).isoformat()
     try:
         if not url.startswith(("http://", "https://")):
             raise ValueError("Only HTTP and HTTPS URLs are supported")
         request = Request(url, headers={"User-Agent": "BootleggerIngestion/1.0"})
         with urlopen(request, timeout=5) as response:
-            html = response.read(2_000_000).decode("utf-8", errors="replace")
+            html = response.read(max_bytes).decode("utf-8", errors="replace")
             final_url = response.geturl()
         parser = WebPageParser()
         parser.feed(html)
@@ -82,7 +82,7 @@ def scrape_web_page(url: str) -> dict:
             "text": text,
             "word_count": len(text.split()),
             "link_count": len(links),
-            "links": links[:100],
+            "links": links[:max_links],
             "status": "healthy",
             "error": "",
         }

@@ -12,6 +12,7 @@ import pandas as pd
 import streamlit as st
 
 from engine import credentials_match as match_credentials, event_to_json, parse_prometheus_metrics, scrape_web_page
+import storage
 
 
 st.set_page_config(
@@ -20,6 +21,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+storage.initialize()
 
 
 def configured_control_room() -> tuple[str, str]:
@@ -72,6 +74,10 @@ def filtered_events() -> list[dict]:
         events = [event for event in events if event["stream"] == selected_stream]
     if selected_type != "all":
         events = [event for event in events if event["type"] == selected_type]
+    window_minutes = {"15 min": 15, "1 hour": 60, "24 hours": 1440, "All time": None}.get(st.session_state.time_window)
+    if window_minutes:
+        cutoff = datetime.now(timezone.utc).timestamp() - window_minutes * 60
+        events = [event for event in events if event["timestamp"].timestamp() >= cutoff]
     return events
 
 
@@ -84,6 +90,7 @@ def create_backup(reason: str) -> None:
     }
     st.session_state.backups.insert(0, snapshot)
     st.session_state.backups = st.session_state.backups[: st.session_state.backup_retention]
+    storage.save_checkpoint(snapshot)
     st.session_state.last_backup_at = time()
 
 
@@ -100,13 +107,14 @@ def maybe_create_backup() -> None:
         create_backup("automatic")
 
 
-def maybe_scrape_web(url: str) -> None:
+def maybe_scrape_web(url: str, max_bytes: int, max_links: int) -> None:
     interval = {"30 sec": 30, "1 min": 60, "5 min": 300}.get(st.session_state.scrape_frequency)
     if interval and time() - st.session_state.last_scrape_at >= interval:
-        result = scrape_web_page(url)
+        result = scrape_web_page(url, max_bytes=max_bytes, max_links=max_links)
         st.session_state.latest_scrape = result
         st.session_state.scrape_history.insert(0, result)
         st.session_state.scrape_history = st.session_state.scrape_history[:20]
+        storage.save_scrape(result)
         st.session_state.last_scrape_at = time()
 
 
@@ -131,7 +139,7 @@ def infrastructure_metrics(source: str, endpoint: str, events: list[dict]) -> tu
     }, "Derived telemetry simulator"
 
 if "events" not in st.session_state:
-    st.session_state.events = seed_events()
+    st.session_state.events = storage.load_events() or seed_events()
 if "started_at" not in st.session_state:
     st.session_state.started_at = time()
 if "selected_stream" not in st.session_state:
@@ -177,7 +185,9 @@ with st.sidebar:
         if st.button("Unlock control room", type="primary", use_container_width=True):
             if credentials_match(st.session_state.control_room_username, st.session_state.control_room_password):
                 st.session_state.control_room_authenticated = True
+                storage.audit("admin", "login_success")
                 st.rerun()
+            storage.audit(st.session_state.control_room_username or "anonymous", "login_failed")
             st.error("Invalid control room credentials.")
     st.divider()
 
@@ -196,15 +206,20 @@ with st.sidebar:
     st.markdown("### Web ingestion")
     if is_admin:
         web_url = st.text_input("Source URL", value="https://example.com")
+        scrape_max_bytes = st.number_input("Max page size (MB)", min_value=1, max_value=20, value=2)
+        scrape_max_links = st.number_input("Max links", min_value=10, max_value=500, value=100)
         st.session_state.scrape_frequency = st.selectbox("Ingestion schedule", ["Manual", "30 sec", "1 min", "5 min"], index=["Manual", "30 sec", "1 min", "5 min"].index(st.session_state.scrape_frequency))
         if st.button("Scrape now", use_container_width=True):
-            st.session_state.latest_scrape = scrape_web_page(web_url)
+            st.session_state.latest_scrape = scrape_web_page(web_url, max_bytes=int(scrape_max_bytes * 1_000_000), max_links=scrape_max_links)
             st.session_state.scrape_history.insert(0, st.session_state.latest_scrape)
             st.session_state.scrape_history = st.session_state.scrape_history[:20]
+            storage.save_scrape(st.session_state.latest_scrape)
             st.session_state.last_scrape_at = time()
             st.rerun()
     else:
         web_url = "https://example.com"
+        scrape_max_bytes = 2
+        scrape_max_links = 100
         st.session_state.scrape_frequency = "Manual"
         st.caption("Sign in to configure ingestion.")
 
@@ -212,6 +227,12 @@ with st.sidebar:
     st.markdown("### View filters")
     st.session_state.selected_stream = st.selectbox("Stream", ["all", *STREAMS], format_func=lambda value: "All streams" if value == "all" else value.title())
     st.session_state.selected_type = st.selectbox("Event type", ["all", *EVENT_TYPES], format_func=lambda value: "All event types" if value == "all" else value.title())
+    st.session_state.time_window = st.selectbox("Time window", ["15 min", "1 hour", "24 hours", "All time"], index=2)
+
+    st.divider()
+    st.markdown("### Alert rules")
+    st.session_state.alert_latency = st.number_input("Latency alert (ms)", min_value=1, max_value=5000, value=250, step=10)
+    st.session_state.alert_queue = st.number_input("Queue alert (events)", min_value=1, max_value=10000, value=10, step=1)
 
     st.divider()
     st.markdown("### Point-in-time backups")
@@ -309,15 +330,17 @@ if st.session_state.streaming and refresh_seconds:
     @st.fragment(run_every=refresh_seconds)
     def refresh_live_console() -> None:
         append_live_event()
+        storage.save_events([event_to_json(event) for event in st.session_state.events])
         maybe_create_backup()
-        maybe_scrape_web(web_url)
+        maybe_scrape_web(web_url, int(scrape_max_bytes * 1_000_000), scrape_max_links)
 
     refresh_live_console()
 
 elif st.session_state.streaming:
     append_live_event()
+    storage.save_events([event_to_json(event) for event in st.session_state.events])
     maybe_create_backup()
-    maybe_scrape_web(web_url)
+    maybe_scrape_web(web_url, int(scrape_max_bytes * 1_000_000), scrape_max_links)
 
 visible_events = filtered_events()
 accepted = sum(event["status"] == "accepted" for event in st.session_state.events)
@@ -337,6 +360,14 @@ for column, (label, value, detail) in zip(metrics, metric_values):
         st.markdown(f'<div class="metric-card"><div class="metric-label">{label}</div><div class="metric-value">{value}</div><div class="subtle">{detail}</div></div>', unsafe_allow_html=True)
 
 st.write("")
+alert_events = [event for event in st.session_state.events if event["latency_ms"] >= st.session_state.alert_latency or event["status"] == "warning"]
+if len(alert_events) >= st.session_state.alert_queue:
+    st.error(f"Alert threshold reached: {len(alert_events)} events require attention.")
+elif alert_events:
+    st.warning(f"{len(alert_events)} events exceed the configured latency or warning threshold.")
+else:
+    st.success("Alert rules healthy for the current event window.")
+
 st.markdown("### Business intelligence")
 bi_overview, bi_streams, bi_risk = st.tabs(["Executive overview", "Stream performance", "Risk & anomalies"])
 bi_data = pd.DataFrame(st.session_state.events)
