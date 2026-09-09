@@ -304,14 +304,16 @@ refresh_seconds = {"250 ms": 0.25, "1 sec": 1.0, "5 sec": 5.0}.get(refresh_rate)
 if st.session_state.streaming and refresh_seconds:
     @st.fragment(run_every=refresh_seconds)
     def refresh_live_console() -> None:
-        st.rerun()
+        append_live_event()
+        maybe_create_backup()
+        maybe_scrape_web(web_url)
 
     refresh_live_console()
 
-if st.session_state.streaming:
+elif st.session_state.streaming:
     append_live_event()
-maybe_create_backup()
-maybe_scrape_web(web_url)
+    maybe_create_backup()
+    maybe_scrape_web(web_url)
 
 visible_events = filtered_events()
 accepted = sum(event["status"] == "accepted" for event in st.session_state.events)
