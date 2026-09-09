@@ -251,6 +251,10 @@ with st.sidebar:
     st.success("Connected")
     st.caption(f"Session started {datetime.fromtimestamp(st.session_state.started_at).strftime('%H:%M:%S')}")
 
+if not is_admin:
+    st.info("Sign in from the control room sidebar to view the live stream.")
+    st.stop()
+
 st.markdown(
     """
     <style>
